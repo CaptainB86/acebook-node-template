@@ -1,15 +1,50 @@
-name: CD
+name: CI/CD
+
 on:
   push:
-    branches: [ main ]
+    branches: [ main, add-tests-before-deploy ]   # pushes still run tests; deploy only runs on main (see "if")
+  pull_request:
+    branches: [ main ]                             # PRs to main run tests only (no deploy)
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:5
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     steps:
       - uses: actions/checkout@v4
 
-      # Auth to AWS using the IAM user keys you saved as secrets
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    # Only deploy on *pushes* to main (never on pull_request events)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: deploy-main
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -17,18 +52,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Package your repo as a zip (must include appspec.yml + scripts)
       - name: Package app
         run: |
           mkdir -p bundle
           zip -qr bundle/revision.zip . -x ".git/*" ".github/*" "node_modules/*"
 
-      # Upload to S3
       - name: Upload to S3
-        run: |
-          aws s3 cp bundle/revision.zip s3://${{ secrets.S3_BUCKET }}/revisions/${{ github.sha }}.zip
+        run: aws s3 cp bundle/revision.zip s3://${{ secrets.S3_BUCKET }}/revisions/${{ github.sha }}.zip
 
-      # Register & trigger CodeDeploy deployment
       - name: Register application revision
         run: |
           aws deploy register-application-revision \
